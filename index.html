@@ -921,6 +921,286 @@ const obs = new IntersectionObserver(entries => {
   entries.forEach(e => { if(e.isIntersecting) e.target.classList.add('in'); });
 }, {threshold: 0.08});
 document.querySelectorAll('.fade-up').forEach(el => obs.observe(el));
+
+// ── PAGE VIEW TRACKER ──
+(function() {
+  const STORE_KEY = 'peakpal_analytics';
+  const SESSION_KEY = 'peakpal_session';
+
+  function getStats() {
+    try {
+      return JSON.parse(localStorage.getItem(STORE_KEY)) || {
+        total: 0, today: 0, todayDate: '', weekly: [],
+        sources: {direct:0, social:0, search:0, other:0},
+        pages: {hero:0, features:0, hiw:0, impact:0, oasis:0},
+        sessions: [], peakHour: new Array(24).fill(0)
+      };
+    } catch(e) { return {total:0,today:0,todayDate:'',weekly:[],sources:{direct:0,social:0,search:0,other:0},pages:{hero:0,features:0,hiw:0,impact:0,oasis:0},sessions:[],peakHour:new Array(24).fill(0)}; }
+  }
+
+  function saveStats(s) {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(s)); } catch(e) {}
+  }
+
+  function getSource() {
+    const ref = document.referrer;
+    if (!ref) return 'direct';
+    if (/instagram|twitter|facebook|tiktok|linkedin/i.test(ref)) return 'social';
+    if (/google|bing|baidu|yahoo/i.test(ref)) return 'search';
+    return 'other';
+  }
+
+  function todayStr() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function recordVisit() {
+    // Deduplicate within same session (30min)
+    const now = Date.now();
+    const lastVisit = parseInt(sessionStorage.getItem(SESSION_KEY) || '0');
+    if (now - lastVisit < 30 * 60 * 1000 && lastVisit > 0) return;
+    sessionStorage.setItem(SESSION_KEY, now);
+
+    const s = getStats();
+    const today = todayStr();
+    const hour = new Date().getHours();
+
+    // Total
+    s.total = (s.total || 0) + 1;
+
+    // Today count
+    if (s.todayDate !== today) {
+      // Push yesterday into weekly
+      if (s.todayDate) {
+        s.weekly = s.weekly || [];
+        s.weekly.push({ date: s.todayDate, count: s.today || 0 });
+        if (s.weekly.length > 7) s.weekly.shift();
+      }
+      s.today = 1;
+      s.todayDate = today;
+    } else {
+      s.today = (s.today || 0) + 1;
+    }
+
+    // Source
+    s.sources = s.sources || {direct:0,social:0,search:0,other:0};
+    const src = getSource();
+    s.sources[src] = (s.sources[src] || 0) + 1;
+
+    // Peak hour
+    s.peakHour = s.peakHour || new Array(24).fill(0);
+    s.peakHour[hour] = (s.peakHour[hour] || 0) + 1;
+
+    // Session log (last 50)
+    s.sessions = s.sessions || [];
+    s.sessions.unshift({
+      time: new Date().toLocaleString('en-GB'),
+      src: src,
+      ua: navigator.userAgent.includes('Mobile') ? 'Mobile' : 'Desktop'
+    });
+    if (s.sessions.length > 50) s.sessions.pop();
+
+    saveStats(s);
+  }
+
+  // Track section views
+  function trackSectionViews() {
+    const sections = [
+      { el: document.querySelector('.hero-section'), key: 'hero' },
+      { el: document.getElementById('ecosystem'), key: 'features' },
+      { el: document.getElementById('plan'), key: 'hiw' },
+      { el: document.querySelector('.impact-section'), key: 'impact' },
+      { el: document.querySelector('.oasis-section'), key: 'oasis' },
+    ];
+    const sObs = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const found = sections.find(s => s.el === entry.target);
+          if (found) {
+            const st = getStats();
+            st.pages = st.pages || {};
+            st.pages[found.key] = (st.pages[found.key] || 0) + 1;
+            saveStats(st);
+            sObs.unobserve(entry.target);
+          }
+        }
+      });
+    }, { threshold: 0.3 });
+    sections.forEach(s => { if (s.el) sObs.observe(s.el); });
+  }
+
+  recordVisit();
+  trackSectionViews();
+
+  // Admin shortcut: type "adm" to open dashboard
+  let keySeq = '';
+  document.addEventListener('keydown', e => {
+    keySeq += e.key.toLowerCase();
+    if (keySeq.includes('adm')) { openAdminPanel(); keySeq = ''; }
+    if (keySeq.length > 10) keySeq = keySeq.slice(-10);
+  });
+
+  window.openAdminPanel = function() {
+    if (document.getElementById('ppAdminPanel')) {
+      document.getElementById('ppAdminPanel').remove(); return;
+    }
+    const s = getStats();
+    const weekly = (s.weekly || []).slice(-6).concat([{ date: todayStr(), count: s.today || 0 }]);
+    const maxW = Math.max(...weekly.map(d => d.count), 1);
+    const maxH = Math.max(...(s.peakHour || []), 1);
+
+    // Build weekly bars
+    const weeklyBars = weekly.map(d => {
+      const pct = Math.round((d.count / maxW) * 100);
+      const label = d.date.slice(5);
+      return `<div class="pp-bar-col"><div class="pp-bar-fill" style="height:${Math.max(pct,2)}%"></div><div class="pp-bar-val">${d.count}</div><div class="pp-bar-lbl">${label}</div></div>`;
+    }).join('');
+
+    // Build 24h heatmap (group by 4h blocks)
+    const hourBlocks = [];
+    for (let i=0;i<24;i+=4) {
+      const sum = (s.peakHour||[]).slice(i,i+4).reduce((a,b)=>a+b,0);
+      hourBlocks.push({label: `${i}–${i+4}h`, val: sum});
+    }
+    const maxHB = Math.max(...hourBlocks.map(b=>b.val),1);
+    const hourBars = hourBlocks.map(b => {
+      const pct = Math.round((b.val/maxHB)*100);
+      return `<div class="pp-bar-col"><div class="pp-bar-fill" style="height:${Math.max(pct,2)}%;background:#E07B2A"></div><div class="pp-bar-val">${b.val}</div><div class="pp-bar-lbl">${b.label}</div></div>`;
+    }).join('');
+
+    // Source breakdown
+    const src = s.sources || {};
+    const totalSrc = Object.values(src).reduce((a,b)=>a+b,0)||1;
+    const srcRows = [
+      {k:'direct',label:'Direct',icon:'🔗'},
+      {k:'social',label:'Social Media',icon:'📱'},
+      {k:'search',label:'Search Engine',icon:'🔍'},
+      {k:'other',label:'Other',icon:'🌐'},
+    ].map(r => {
+      const pct = Math.round(((src[r.k]||0)/totalSrc)*100);
+      return `<div class="pp-src-row"><span>${r.icon} ${r.label}</span><div class="pp-src-bar"><div class="pp-src-fill" style="width:${pct}%"></div></div><span>${src[r.k]||0} (${pct}%)</span></div>`;
+    }).join('');
+
+    // Page sections
+    const pg = s.pages || {};
+    const pgItems = [
+      {k:'hero',label:'Hero Section'},
+      {k:'features',label:'Core Features'},
+      {k:'hiw',label:'How It Works'},
+      {k:'impact',label:'Impact Dashboard'},
+      {k:'oasis',label:'Eco-Oasis'},
+    ].map(p => `<div class="pp-pg-row"><span>${p.label}</span><span class="pp-pg-val">${pg[p.k]||0}</span></div>`).join('');
+
+    // Recent sessions
+    const sess = (s.sessions||[]).slice(0,8).map(s =>
+      `<div class="pp-sess-row"><span class="pp-sess-time">${s.time}</span><span class="pp-sess-badge ${s.ua==='Mobile'?'mob':'desk'}">${s.ua}</span><span class="pp-sess-src">${s.src}</span></div>`
+    ).join('') || '<div style="color:rgba(255,255,255,.3);font-size:12px;padding:8px 0">No sessions recorded yet</div>';
+
+    const panel = document.createElement('div');
+    panel.id = 'ppAdminPanel';
+    panel.innerHTML = `
+<style>
+#ppAdminPanel{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.7);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:16px;font-family:'Nunito Sans',sans-serif}
+.pp-box{background:#111;border:1px solid rgba(255,255,255,.1);border-radius:24px;width:100%;max-width:900px;max-height:90vh;overflow-y:auto;padding:32px}
+.pp-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}
+.pp-title{font-size:20px;font-weight:700;color:white;letter-spacing:-.01em}
+.pp-close{background:rgba(255,255,255,.08);border:none;color:white;width:36px;height:36px;border-radius:50%;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.pp-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:28px}
+.pp-kpi-card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:18px}
+.pp-kpi-label{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.35);margin-bottom:8px}
+.pp-kpi-val{font-size:32px;font-weight:700;color:white;letter-spacing:-.03em;line-height:1}
+.pp-kpi-sub{font-size:11px;color:rgba(255,255,255,.3);margin-top:4px}
+.pp-kpi-card.amber .pp-kpi-val{color:#E07B2A}
+.pp-kpi-card.green .pp-kpi-val{color:#4ADE80}
+.pp-section-title{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:rgba(255,255,255,.4);margin-bottom:14px}
+.pp-chart-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+.pp-chart-box{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:18px}
+.pp-bars{display:flex;align-items:flex-end;gap:6px;height:80px;margin-bottom:8px}
+.pp-bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px}
+.pp-bar-fill{width:100%;background:#1C3F30;border-radius:4px 4px 0 0;transition:height .6s;min-height:2px}
+.pp-bar-val{font-size:9px;color:rgba(255,255,255,.4)}
+.pp-bar-lbl{font-size:9px;color:rgba(255,255,255,.3)}
+.pp-src-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12px;color:rgba(255,255,255,.6)}
+.pp-src-row span:first-child{min-width:90px}
+.pp-src-bar{flex:1;height:5px;background:rgba(255,255,255,.08);border-radius:100px;overflow:hidden}
+.pp-src-fill{height:100%;background:#1C3F30;border-radius:100px}
+.pp-src-row span:last-child{min-width:70px;text-align:right;font-size:11px}
+.pp-pg-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px;color:rgba(255,255,255,.6)}
+.pp-pg-val{font-weight:700;color:white}
+.pp-sess-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.pp-sess-time{font-size:11px;color:rgba(255,255,255,.35);flex:1}
+.pp-sess-badge{font-size:10px;font-weight:700;padding:2px 8px;border-radius:100px}
+.pp-sess-badge.mob{background:rgba(224,123,42,.15);color:#E07B2A}
+.pp-sess-badge.desk{background:rgba(28,63,48,.4);color:#8AAF92}
+.pp-sess-src{font-size:11px;color:rgba(255,255,255,.3);min-width:60px}
+.pp-bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+.pp-reset{margin-top:20px;background:rgba(255,60,60,.1);border:1px solid rgba(255,60,60,.2);color:rgba(255,100,100,.7);padding:8px 16px;border-radius:8px;font-size:12px;cursor:pointer;font-family:inherit;transition:background .2s}
+.pp-reset:hover{background:rgba(255,60,60,.2)}
+@media(max-width:600px){.pp-kpi{grid-template-columns:1fr 1fr}.pp-chart-row{grid-template-columns:1fr}.pp-bottom-grid{grid-template-columns:1fr}.pp-box{padding:20px}}
+</style>
+<div class="pp-box">
+  <div class="pp-header">
+    <div class="pp-title">📊 PeakPal Analytics</div>
+    <button class="pp-close" onclick="document.getElementById('ppAdminPanel').remove()">✕</button>
+  </div>
+
+  <div class="pp-kpi">
+    <div class="pp-kpi-card">
+      <div class="pp-kpi-label">Total Visits</div>
+      <div class="pp-kpi-val">${s.total||0}</div>
+      <div class="pp-kpi-sub">Cumulative unique visitors</div>
+    </div>
+    <div class="pp-kpi-card amber">
+      <div class="pp-kpi-label">Today's Visits</div>
+      <div class="pp-kpi-val">${s.today||0}</div>
+      <div class="pp-kpi-sub">${todayStr()}</div>
+    </div>
+    <div class="pp-kpi-card green">
+      <div class="pp-kpi-label">This Week</div>
+      <div class="pp-kpi-val">${weekly.reduce((a,b)=>a+b.count,0)}</div>
+      <div class="pp-kpi-sub">Last 7 days</div>
+    </div>
+    <div class="pp-kpi-card">
+      <div class="pp-kpi-label">Mobile Share</div>
+      <div class="pp-kpi-val">${s.sessions&&s.sessions.length?Math.round(s.sessions.filter(x=>x.ua==='Mobile').length/Math.min(s.sessions.length,50)*100):0}%</div>
+      <div class="pp-kpi-sub">Last 50 sessions</div>
+    </div>
+  </div>
+
+  <div class="pp-chart-row">
+    <div class="pp-chart-box">
+      <div class="pp-section-title">📅 7-Day Visit Trend</div>
+      <div class="pp-bars">${weeklyBars}</div>
+    </div>
+    <div class="pp-chart-box">
+      <div class="pp-section-title">🕐 Peak Hours</div>
+      <div class="pp-bars">${hourBars}</div>
+    </div>
+  </div>
+
+  <div class="pp-chart-row">
+    <div class="pp-chart-box">
+      <div class="pp-section-title">🔗 Traffic Sources</div>
+      ${srcRows}
+    </div>
+    <div class="pp-chart-box">
+      <div class="pp-section-title">📄 Section Views</div>
+      ${pgItems}
+    </div>
+  </div>
+
+  <div class="pp-chart-box" style="margin-top:0">
+    <div class="pp-section-title">🕒 Recent Sessions</div>
+    ${sess}
+  </div>
+
+  <button class="pp-reset" onclick="if(confirm('Clear all analytics data?')){localStorage.removeItem('peakpal_analytics');document.getElementById('ppAdminPanel').remove();alert('Cleared')}">🗑 Clear All Data</button>
+</div>
+`;
+    panel.addEventListener('click', e => { if(e.target===panel) panel.remove(); });
+    document.body.appendChild(panel);
+  };
+})();
 </script>
 </body>
 </html>
